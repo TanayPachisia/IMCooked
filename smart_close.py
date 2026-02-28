@@ -1,17 +1,18 @@
 """Script to close ALL positions at a profit.
 
 Keeps running until all positions are closed profitably.
-Uses trade history to calculate average entry prices.
+- Cancels unfilled orders each loop
+- Retries until position is actually 0
 """
 
 import time
 from bot import BaseBot, OrderBook, Trade, OrderRequest, Side
 
 TEST_URL = "http://ec2-52-49-69-152.eu-west-1.compute.amazonaws.com/"
-USERNAME = "IMCooked"
-PASSWORD = "imsocooked"
+USERNAME = "test1"
+PASSWORD = "test1"
 
-CHECK_INTERVAL = 5  # seconds between checks
+CHECK_INTERVAL = 3  # seconds between checks
 
 
 class PositionCloser(BaseBot):
@@ -23,9 +24,7 @@ class PositionCloser(BaseBot):
 
 
 def calculate_entry_prices(trades: list[Trade], username: str) -> dict:
-    """
-    Calculate average entry price for longs and shorts separately.
-    """
+    """Calculate average entry price for longs and shorts separately."""
     positions = {}
 
     for trade in trades:
@@ -60,10 +59,6 @@ def calculate_entry_prices(trades: list[Trade], username: str) -> dict:
 print(f"\nConnecting to exchange as {USERNAME}...")
 bot = PositionCloser(TEST_URL, USERNAME, PASSWORD)
 
-# Cancel all open orders first
-print("Cancelling all open orders...")
-bot.cancel_all_orders()
-
 # Fetch trade history once at start
 print("Fetching trade history...")
 trades = bot.get_market_trades()
@@ -79,7 +74,11 @@ print("="*60)
 
 try:
     while True:
-        # Get current positions
+        # ALWAYS cancel all orders first - this frees up positions for closing
+        bot.cancel_all_orders()
+        time.sleep(0.3)
+
+        # Get FRESH positions after cancelling orders
         positions = bot.get_positions()
 
         # Filter to non-zero positions
@@ -112,8 +111,13 @@ try:
                             resp = bot.send_order(order)
                             if resp:
                                 print(f"    -> filled={resp.filled}/{resp.volume}")
-                            # Refresh entry data after trade
-                            time.sleep(0.5)
+                                # If not fully filled, cancel the remainder
+                                if resp.filled < resp.volume:
+                                    bot.cancel_order(resp.id)
+                                    print(f"    -> cancelled unfilled portion")
+
+                            # Refresh entry data
+                            time.sleep(0.3)
                             trades = bot.get_market_trades()
                             my_trades = [t for t in trades if t.buyer == USERNAME or t.seller == USERNAME]
                             entry_data = calculate_entry_prices(my_trades, USERNAME)
@@ -138,8 +142,13 @@ try:
                             resp = bot.send_order(order)
                             if resp:
                                 print(f"    -> filled={resp.filled}/{resp.volume}")
-                            # Refresh entry data after trade
-                            time.sleep(0.5)
+                                # If not fully filled, cancel the remainder
+                                if resp.filled < resp.volume:
+                                    bot.cancel_order(resp.id)
+                                    print(f"    -> cancelled unfilled portion")
+
+                            # Refresh entry data
+                            time.sleep(0.3)
                             trades = bot.get_market_trades()
                             my_trades = [t for t in trades if t.buyer == USERNAME or t.seller == USERNAME]
                             entry_data = calculate_entry_prices(my_trades, USERNAME)
