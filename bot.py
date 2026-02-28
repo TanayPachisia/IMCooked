@@ -201,7 +201,13 @@ class BaseBot(ABC):
             headers=STANDARD_HEADERS,
             json={"username": self.username, "password": self._password},
         )
-        response.raise_for_status()
+        if not response.ok:
+            print(f"Authentication failed: {response.status_code} - {response.text}")
+            response.raise_for_status()
+        if "Authorization" not in response.headers:
+            print(f"Auth response headers: {dict(response.headers)}")
+            print(f"Auth response body: {response.text}")
+            raise ValueError("Server did not return Authorization header. Check credentials.")
         return response.headers["Authorization"]
 
     # -- lifecycle --
@@ -253,8 +259,11 @@ class BaseBot(ABC):
             return self.trades
 
         new_trades = []
+        trade_fields = {f for f in Trade.__dataclass_fields__}
         for raw in response.json():
-            trade = Trade(**raw)
+            # Filter to only fields that Trade expects
+            filtered = {k: v for k, v in raw.items() if k in trade_fields}
+            trade = Trade(**filtered)
             if self._trade_watermark is None or trade.timestamp > self._trade_watermark:
                 new_trades.append(trade)
 
@@ -375,15 +384,19 @@ class ETFArbitrageBot(BaseBot):
         # Track orderbooks for all relevant markets
         self.orderbooks: dict[str, OrderBook] = {}
 
-        # Configuration
-        self.MARKET_1 = "M1"  # Water level
-        self.MARKET_3 = "M3"  # Temperature * Humidity
-        self.MARKET_5 = "M5"  # Airport arrivals
-        self.MARKET_7 = "M7"  # ETF
+        # Configuration - actual product symbols from the exchange
+        self.MARKET_1 = "TIDE_SPOT"  # Water level (abs tidal height in mm)
+        self.MARKET_3 = "WX_SPOT"    # Temperature * Humidity at settlement
+        self.MARKET_5 = "LHR_COUNT"  # Airport arrivals + departures
+        self.MARKET_7 = "LON_ETF"    # ETF = TIDE_SPOT + WX_SPOT + LHR_COUNT
 
-        self.MIN_SPREAD = 5  # Minimum spread to trigger arbitrage
-        self.MAX_POSITION = 100  # Maximum position per market
-        self.ORDER_SIZE = 5  # Size per arbitrage trade
+        self.MIN_SPREAD = 5    # Minimum spread to trigger arbitrage
+        self.MAX_POSITION = 100  # Maximum position per market (exchange limit is ±100)
+        self.ORDER_SIZE = 5    # Size per arbitrage trade
+
+        # Rate limiting to avoid spamming exchange
+        self._last_trade_time = 0
+        self._min_trade_interval = 1.0  # Minimum seconds between trades
 
     def on_orderbook(self, orderbook: OrderBook) -> None:
         """Store orderbook updates and check for arbitrage opportunities."""
@@ -444,6 +457,11 @@ class ETFArbitrageBot(BaseBot):
     def check_arbitrage(self) -> None:
         """Check for arbitrage opportunities between ETF and its components."""
         try:
+            # Rate limiting - don't trade too frequently
+            current_time = time.monotonic()
+            if current_time - self._last_trade_time < self._min_trade_interval:
+                return
+
             positions = self.get_positions()
 
             # Get ETF prices
@@ -481,6 +499,7 @@ class ETFArbitrageBot(BaseBot):
 
                     print(f"Arbitrage: ETF overpriced by {spread_1:.2f}. Buying components, selling ETF.")
                     self.execute_arbitrage_etf_overpriced()
+                    self._last_trade_time = time.monotonic()
 
             elif spread_2 > self.MIN_SPREAD:
                 # ETF underpriced: buy ETF, sell components
@@ -491,6 +510,7 @@ class ETFArbitrageBot(BaseBot):
 
                     print(f"Arbitrage: ETF underpriced by {spread_2:.2f}. Buying ETF, selling components.")
                     self.execute_arbitrage_etf_underpriced()
+                    self._last_trade_time = time.monotonic()
 
         except Exception as e:
             print(f"Error in check_arbitrage: {e}")
@@ -515,7 +535,10 @@ class ETFArbitrageBot(BaseBot):
         orders.append(OrderRequest(self.MARKET_5, ask_5, Side.BUY, self.ORDER_SIZE))
         orders.append(OrderRequest(self.MARKET_7, bid_7, Side.SELL, self.ORDER_SIZE))
 
-        self.send_orders(orders)
+        print(f"  Sending orders: BUY {self.MARKET_1}@{ask_1}, BUY {self.MARKET_3}@{ask_3}, BUY {self.MARKET_5}@{ask_5}, SELL {self.MARKET_7}@{bid_7}")
+        responses = self.send_orders(orders)
+        for r in responses:
+            print(f"    -> {r.side} {r.product} {r.filled}/{r.volume}@{r.price} (status={r.status})")
 
     def execute_arbitrage_etf_underpriced(self) -> None:
         """Execute arbitrage when ETF is underpriced: buy ETF, sell components."""
@@ -537,4 +560,7 @@ class ETFArbitrageBot(BaseBot):
         orders.append(OrderRequest(self.MARKET_3, bid_3, Side.SELL, self.ORDER_SIZE))
         orders.append(OrderRequest(self.MARKET_5, bid_5, Side.SELL, self.ORDER_SIZE))
 
-        self.send_orders(orders)
+        print(f"  Sending orders: BUY {self.MARKET_7}@{ask_7}, SELL {self.MARKET_1}@{bid_1}, SELL {self.MARKET_3}@{bid_3}, SELL {self.MARKET_5}@{bid_5}")
+        responses = self.send_orders(orders)
+        for r in responses:
+            print(f"    -> {r.side} {r.product} {r.filled}/{r.volume}@{r.price} (status={r.status})")
