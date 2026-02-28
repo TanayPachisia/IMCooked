@@ -361,3 +361,180 @@ class BaseBot(ABC):
 
     def _auth_headers(self) -> dict[str, str]:
         return {**STANDARD_HEADERS, "Authorization": self.auth_token}
+
+
+class ETFArbitrageBot(BaseBot):
+    """ETF Arbitrage bot that exploits price differences between ETF and its components.
+
+    ETF (Market 7) = Market 1 (Water) + Market 3 (Weather) + Market 5 (Airport arrivals)
+    """
+
+    def __init__(self, cmi_url: str, username: str, password: str):
+        super().__init__(cmi_url, username, password)
+
+        # Track orderbooks for all relevant markets
+        self.orderbooks: dict[str, OrderBook] = {}
+
+        # Configuration
+        self.MARKET_1 = "M1"  # Water level
+        self.MARKET_3 = "M3"  # Temperature * Humidity
+        self.MARKET_5 = "M5"  # Airport arrivals
+        self.MARKET_7 = "M7"  # ETF
+
+        self.MIN_SPREAD = 5  # Minimum spread to trigger arbitrage
+        self.MAX_POSITION = 100  # Maximum position per market
+        self.ORDER_SIZE = 5  # Size per arbitrage trade
+
+    def on_orderbook(self, orderbook: OrderBook) -> None:
+        """Store orderbook updates and check for arbitrage opportunities."""
+        self.orderbooks[orderbook.product] = orderbook
+
+        # Check for arbitrage when we have all orderbooks
+        if all(m in self.orderbooks for m in [self.MARKET_1, self.MARKET_3, self.MARKET_5, self.MARKET_7]):
+            self.check_arbitrage()
+
+    def on_trades(self, trade: Trade) -> None:
+        """Handle trade events."""
+        pass
+
+    def get_best_bid(self, product: str) -> float | None:
+        """Get best bid price for a product."""
+        if product not in self.orderbooks:
+            return None
+        book = self.orderbooks[product]
+        return book.buy_orders[0].price if book.buy_orders else None
+
+    def get_best_ask(self, product: str) -> float | None:
+        """Get best ask price for a product."""
+        if product not in self.orderbooks:
+            return None
+        book = self.orderbooks[product]
+        return book.sell_orders[0].price if book.sell_orders else None
+
+    def get_mid_price(self, product: str) -> float | None:
+        """Get mid price for a product."""
+        bid = self.get_best_bid(product)
+        ask = self.get_best_ask(product)
+        if bid is None or ask is None:
+            return None
+        return (bid + ask) / 2
+
+    def get_synthetic_etf_bid(self) -> float | None:
+        """Calculate the synthetic ETF bid (what we can sell components for)."""
+        # To create ETF, we buy components, so we use best bid prices (what we can sell for)
+        bid_1 = self.get_best_bid(self.MARKET_1)
+        bid_3 = self.get_best_bid(self.MARKET_3)
+        bid_5 = self.get_best_bid(self.MARKET_5)
+
+        if None in [bid_1, bid_3, bid_5]:
+            return None
+        return bid_1 + bid_3 + bid_5
+
+    def get_synthetic_etf_ask(self) -> float | None:
+        """Calculate the synthetic ETF ask (what we must pay for components)."""
+        # To create ETF, we buy components, so we use best ask prices (what we must pay)
+        ask_1 = self.get_best_ask(self.MARKET_1)
+        ask_3 = self.get_best_ask(self.MARKET_3)
+        ask_5 = self.get_best_ask(self.MARKET_5)
+
+        if None in [ask_1, ask_3, ask_5]:
+            return None
+        return ask_1 + ask_3 + ask_5
+
+    def check_arbitrage(self) -> None:
+        """Check for arbitrage opportunities between ETF and its components."""
+        try:
+            positions = self.get_positions()
+
+            # Get ETF prices
+            etf_bid = self.get_best_bid(self.MARKET_7)
+            etf_ask = self.get_best_ask(self.MARKET_7)
+
+            # Get synthetic ETF prices
+            synthetic_bid = self.get_synthetic_etf_bid()
+            synthetic_ask = self.get_synthetic_etf_ask()
+
+            if None in [etf_bid, etf_ask, synthetic_bid, synthetic_ask]:
+                return
+
+            # Opportunity 1: ETF is overpriced
+            # Buy components (at synthetic_ask), sell ETF (at etf_bid)
+            spread_1 = etf_bid - synthetic_ask
+
+            # Opportunity 2: ETF is underpriced
+            # Buy ETF (at etf_ask), sell components (at synthetic_bid)
+            spread_2 = synthetic_bid - etf_ask
+
+            # Check position limits
+            pos_1 = positions.get(self.MARKET_1, 0)
+            pos_3 = positions.get(self.MARKET_3, 0)
+            pos_5 = positions.get(self.MARKET_5, 0)
+            pos_7 = positions.get(self.MARKET_7, 0)
+
+            # Execute arbitrage if spread is sufficient
+            if spread_1 > self.MIN_SPREAD:
+                # ETF overpriced: buy components, sell ETF
+                if (abs(pos_1 + self.ORDER_SIZE) <= self.MAX_POSITION and
+                    abs(pos_3 + self.ORDER_SIZE) <= self.MAX_POSITION and
+                    abs(pos_5 + self.ORDER_SIZE) <= self.MAX_POSITION and
+                    abs(pos_7 - self.ORDER_SIZE) <= self.MAX_POSITION):
+
+                    print(f"Arbitrage: ETF overpriced by {spread_1:.2f}. Buying components, selling ETF.")
+                    self.execute_arbitrage_etf_overpriced()
+
+            elif spread_2 > self.MIN_SPREAD:
+                # ETF underpriced: buy ETF, sell components
+                if (abs(pos_1 - self.ORDER_SIZE) <= self.MAX_POSITION and
+                    abs(pos_3 - self.ORDER_SIZE) <= self.MAX_POSITION and
+                    abs(pos_5 - self.ORDER_SIZE) <= self.MAX_POSITION and
+                    abs(pos_7 + self.ORDER_SIZE) <= self.MAX_POSITION):
+
+                    print(f"Arbitrage: ETF underpriced by {spread_2:.2f}. Buying ETF, selling components.")
+                    self.execute_arbitrage_etf_underpriced()
+
+        except Exception as e:
+            print(f"Error in check_arbitrage: {e}")
+
+    def execute_arbitrage_etf_overpriced(self) -> None:
+        """Execute arbitrage when ETF is overpriced: buy components, sell ETF."""
+        orders = []
+
+        # Buy components at market (cross the spread)
+        ask_1 = self.get_best_ask(self.MARKET_1)
+        ask_3 = self.get_best_ask(self.MARKET_3)
+        ask_5 = self.get_best_ask(self.MARKET_5)
+
+        # Sell ETF at market
+        bid_7 = self.get_best_bid(self.MARKET_7)
+
+        if None in [ask_1, ask_3, ask_5, bid_7]:
+            return
+
+        orders.append(OrderRequest(self.MARKET_1, ask_1, Side.BUY, self.ORDER_SIZE))
+        orders.append(OrderRequest(self.MARKET_3, ask_3, Side.BUY, self.ORDER_SIZE))
+        orders.append(OrderRequest(self.MARKET_5, ask_5, Side.BUY, self.ORDER_SIZE))
+        orders.append(OrderRequest(self.MARKET_7, bid_7, Side.SELL, self.ORDER_SIZE))
+
+        self.send_orders(orders)
+
+    def execute_arbitrage_etf_underpriced(self) -> None:
+        """Execute arbitrage when ETF is underpriced: buy ETF, sell components."""
+        orders = []
+
+        # Buy ETF at market
+        ask_7 = self.get_best_ask(self.MARKET_7)
+
+        # Sell components at market
+        bid_1 = self.get_best_bid(self.MARKET_1)
+        bid_3 = self.get_best_bid(self.MARKET_3)
+        bid_5 = self.get_best_bid(self.MARKET_5)
+
+        if None in [ask_7, bid_1, bid_3, bid_5]:
+            return
+
+        orders.append(OrderRequest(self.MARKET_7, ask_7, Side.BUY, self.ORDER_SIZE))
+        orders.append(OrderRequest(self.MARKET_1, bid_1, Side.SELL, self.ORDER_SIZE))
+        orders.append(OrderRequest(self.MARKET_3, bid_3, Side.SELL, self.ORDER_SIZE))
+        orders.append(OrderRequest(self.MARKET_5, bid_5, Side.SELL, self.ORDER_SIZE))
+
+        self.send_orders(orders)
